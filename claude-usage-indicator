@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Claude Usage Indicator — GNOME top-bar tray app for Ubuntu.
+
+Shows your Claude subscription rate-limit usage (same data as Claude Code's
+/usage command): 5-hour session window and 7-day weekly limits.
+
+Reads the OAuth token Claude Code stores in ~/.claude/.credentials.json
+(or $CLAUDE_CONFIG_DIR, or $CLAUDE_CODE_OAUTH_TOKEN) and polls the usage
+endpoint every 3 minutes. Stdlib + PyGObject only.
+"""
+
+import json
+import os
+import subprocess
+import threading
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "3.0")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3 as AppIndicator
+from gi.repository import Gtk, GLib
+
+APP_ID = "claude-usage-indicator"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CREDENTIAL_PATHS = [
+    Path(p) / ".credentials.json"
+    for p in [os.environ.get("CLAUDE_CONFIG_DIR"),
+              Path.home() / ".claude",
+              Path.home() / ".config" / "claude"]
+    if p
+]
+POLL_SECONDS = 180          # community-tested safe interval
+MAX_BACKOFF = 900           # cap backoff at 15 min on 429s
+USER_AGENT = "claude-code/2.0.0"
+ICON_DIR = Path(__file__).resolve().parent.parent / "share" / APP_ID / "icons"
+
+WINDOWS = [
+    ("five_hour", "5-hour session"),
+    ("seven_day", "Weekly (all models)"),
+    ("seven_day_opus", "Weekly (Opus)"),
+    ("seven_day_sonnet", "Weekly (Sonnet)"),
+]
+
+
+def read_token():
+    """Return (access_token, expires_at_ms) or (None, None)."""
+    env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env:
+        return env, None
+    for path in CREDENTIAL_PATHS:
+        try:
+            data = json.loads(path.read_text())
+            oauth = data.get("claudeAiOauth", {})
+            if oauth.get("accessToken"):
+                return oauth["accessToken"], oauth.get("expiresAt")
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None, None
+
+
+def fetch_usage(token):
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
+
+
+def fmt_reset(iso_ts):
+    """ISO timestamp -> local 'Sat 14:00' style string."""
+    try:
+        dt = datetime.fromisoformat(iso_ts).astimezone()
+        today = datetime.now().astimezone().date()
+        if dt.date() == today:
+            return dt.strftime("%H:%M")
+        return dt.strftime("%a %H:%M")
+    except (ValueError, TypeError):
+        return "?"
+
+
+class UsageIndicator:
+    def __init__(self):
+        self.indicator = AppIndicator.Indicator.new(
+            APP_ID, "claude-usage-ok",
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+        if ICON_DIR.is_dir():
+            self.indicator.set_icon_theme_path(str(ICON_DIR))
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_label("…", "100%")
+
+        self.backoff = POLL_SECONDS
+        self.detail_items = []
+        self.status_item = None
+        self.build_menu()
+        GLib.idle_add(self.refresh)
+
+    def build_menu(self):
+        menu = Gtk.Menu()
+        for _key, title in WINDOWS + [("extra", "Extra usage")]:
+            item = Gtk.MenuItem(label=f"{title}: —")
+            item.set_sensitive(False)
+            menu.append(item)
+            self.detail_items.append(item)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        self.status_item = Gtk.MenuItem(label="Waiting for first update…")
+        self.status_item.set_sensitive(False)
+        menu.append(self.status_item)
+
+        refresh = Gtk.MenuItem(label="Refresh now")
+        refresh.connect("activate", lambda *_: self.refresh())
+        menu.append(refresh)
+
+        usage_page = Gtk.MenuItem(label="Open claude.ai usage settings")
+        usage_page.connect("activate", lambda *_: subprocess.Popen(
+            ["xdg-open", "https://claude.ai/settings/usage"]))
+        menu.append(usage_page)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda *_: Gtk.main_quit())
+        menu.append(quit_item)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    # ---- polling ----
+
+    def refresh(self):
+        threading.Thread(target=self._fetch, daemon=True).start()
+        return False  # one-shot; next poll scheduled in _apply/_fail
+
+    def _fetch(self):
+        token, _ = read_token()
+        if not token:
+            GLib.idle_add(self._fail,
+                          "No credentials — run Claude Code once to log in")
+            return
+        try:
+            data = fetch_usage(token)
+            GLib.idle_add(self._apply, data)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                msg = "Token expired — open Claude Code to refresh it"
+            elif e.code == 429:
+                msg = "Rate limited — backing off"
+            else:
+                msg = f"HTTP {e.code}"
+            GLib.idle_add(self._fail, msg, e.code == 429)
+        except Exception as e:  # network down, timeout, bad JSON…
+            GLib.idle_add(self._fail, f"Error: {e.__class__.__name__}")
+
+    def _apply(self, data):
+        self.backoff = POLL_SECONDS
+        utils = []
+        for i, (key, title) in enumerate(WINDOWS):
+            w = data.get(key)
+            if w and w.get("utilization") is not None:
+                pct = round(w["utilization"])
+                utils.append((key, pct))
+                label = f"{title}: {pct}%  (resets {fmt_reset(w.get('resets_at'))})"
+            else:
+                label = f"{title}: —"
+            self.detail_items[i].set_label(label)
+
+        extra = data.get("extra_usage") or {}
+        if extra.get("is_enabled"):
+            used = extra.get("used_credits")
+            limit = extra.get("monthly_limit")
+            self.detail_items[-1].set_label(
+                f"Extra usage: {used} / {limit} credits")
+        else:
+            self.detail_items[-1].set_label("Extra usage: off")
+
+        five = next((p for k, p in utils if k == "five_hour"), 0)
+        week = next((p for k, p in utils if k == "seven_day"), 0)
+        self.indicator.set_label(f"{five}% · wk {week}%", "100% · wk 100%")
+
+        worst = max((p for _, p in utils), default=0)
+        icon = ("claude-usage-crit" if worst >= 90
+                else "claude-usage-warn" if worst >= 70
+                else "claude-usage-ok")
+        self.indicator.set_icon_full(icon, "Claude usage")
+
+        self.status_item.set_label(
+            "Updated " + datetime.now().strftime("%H:%M:%S"))
+        GLib.timeout_add_seconds(POLL_SECONDS, self.refresh)
+
+    def _fail(self, message, rate_limited=False):
+        self.status_item.set_label(message)
+        self.indicator.set_label("!", "100% · wk 100%")
+        self.indicator.set_icon_full("claude-usage-warn", "Claude usage error")
+        if rate_limited:
+            self.backoff = min(self.backoff * 2, MAX_BACKOFF)
+        GLib.timeout_add_seconds(self.backoff, self.refresh)
+
+
+def main():
+    UsageIndicator()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

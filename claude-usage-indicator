@@ -7,15 +7,33 @@ Shows your Claude subscription rate-limit usage (same data as Claude Code's
 Reads the OAuth token Claude Code stores in ~/.claude/.credentials.json
 (or $CLAUDE_CONFIG_DIR, or $CLAUDE_CODE_OAUTH_TOKEN) and polls the usage
 endpoint every 3 minutes. Stdlib + PyGObject only.
+
+Token handling is three-tiered so a stale token no longer sticks the icon in
+an error state:
+  1. Passive re-read   — the on-disk credentials may already have been
+     refreshed by Claude Code; re-read before doing anything.
+  2. Active refresh    — use the stored refresh_token to mint a new access
+     token (on 401 or just before expiry) and write it back atomically.
+  3. In-app sign-in    — if the refresh token itself is dead, offer a native
+     "Sign in to Claude" flow (OAuth 2.0 + PKCE) straight from the menu, so
+     you never have to drop to the CLI.
+
+Error and sign-in states use their own distinct icons; the amber/red icons
+now mean *usage* only, never an error.
 """
 
+import base64
+import hashlib
 import json
 import os
+import secrets
 import subprocess
 import threading
-import urllib.request
+import time
 import urllib.error
-from datetime import datetime, timezone
+import urllib.parse
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 import gi
@@ -30,15 +48,32 @@ from gi.repository import Gtk, GLib
 
 APP_ID = "claude-usage-indicator"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-CREDENTIAL_PATHS = [
-    Path(p) / ".credentials.json"
-    for p in [os.environ.get("CLAUDE_CONFIG_DIR"),
-              Path.home() / ".claude",
-              Path.home() / ".config" / "claude"]
+
+# ---- OAuth (Claude Code public client) ----
+# client_id is a public application identifier for "Claude Code", not a secret.
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
+OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+# Token endpoint moved from console.anthropic.com -> platform.claude.com; try
+# the current one first, fall back to the legacy host for resilience.
+OAUTH_TOKEN_URLS = [
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+]
+OAUTH_SCOPES = "user:inference user:profile user:sessions:claude_code user:mcp_servers"
+
+CONFIG_DIRS = [
+    p for p in [os.environ.get("CLAUDE_CONFIG_DIR"),
+                str(Path.home() / ".claude"),
+                str(Path.home() / ".config" / "claude")]
     if p
 ]
+CREDENTIAL_PATHS = [Path(p) / ".credentials.json" for p in CONFIG_DIRS]
+DEFAULT_CREDENTIAL_PATH = Path.home() / ".claude" / ".credentials.json"
+
 POLL_SECONDS = 180          # community-tested safe interval
 MAX_BACKOFF = 900           # cap backoff at 15 min on 429s
+EXPIRY_SKEW_MS = 60_000     # refresh if within 60s of expiry
 USER_AGENT = "claude-code/2.0.0"
 ICON_DIR = Path(__file__).resolve().parent.parent / "share" / APP_ID / "icons"
 
@@ -50,23 +85,127 @@ WINDOWS = [
 ]
 
 
-def read_token():
-    """Return (access_token, expires_at_ms) or (None, None)."""
-    env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if env:
-        return env, None
+# --------------------------------------------------------------------------- #
+# Credentials / OAuth
+# --------------------------------------------------------------------------- #
+
+class AuthError(Exception):
+    """Base for auth problems."""
+
+
+class NeedSignIn(AuthError):
+    """No usable credentials and no way to refresh — user must sign in."""
+
+
+class TransientError(Exception):
+    """Network/server hiccup — keep last-good data and retry."""
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def load_oauth():
+    """Return (oauth_dict, source_path) from the first credentials file found,
+    or ({'accessToken': env}, None) if only the env var is set, or (None, None)."""
     for path in CREDENTIAL_PATHS:
         try:
             data = json.loads(path.read_text())
-            oauth = data.get("claudeAiOauth", {})
-            if oauth.get("accessToken"):
-                return oauth["accessToken"], oauth.get("expiresAt")
         except (OSError, json.JSONDecodeError):
             continue
+        oauth = data.get("claudeAiOauth")
+        if oauth and oauth.get("accessToken"):
+            return oauth, path
+    env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env:
+        return {"accessToken": env}, None
     return None, None
 
 
-def fetch_usage(token):
+def _write_oauth(oauth: dict, path: Path):
+    """Atomically merge the oauth block back into the credentials file."""
+    if path is None:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    existing["claudeAiOauth"] = oauth
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(existing, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _token_post(fields: dict) -> dict:
+    """POST form-encoded to the OAuth token endpoint, trying both hosts.
+    Distinguishes a dead grant (needs sign-in) from a transient failure."""
+    body = urllib.parse.urlencode(fields).encode()
+    last_transient = None
+    for url in OAUTH_TOKEN_URLS:
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent": USER_AGENT, "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            # 400/401 = invalid_grant / bad request: the grant is dead, retrying
+            # another host won't help.
+            if e.code in (400, 401, 403):
+                raise NeedSignIn(f"grant rejected (HTTP {e.code})")
+            last_transient = TransientError(f"token endpoint HTTP {e.code}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_transient = TransientError(f"token endpoint unreachable: {e}")
+    raise last_transient or TransientError("token endpoint failed")
+
+
+def _store_token_response(data: dict, path: Path) -> dict:
+    """Normalise a token response into our oauth dict and persist it."""
+    expires_in = int(data.get("expires_in", 28800))
+    oauth = {
+        "accessToken": data["access_token"],
+        "refreshToken": data.get("refresh_token"),
+        "expiresAt": int(time.time() * 1000) + expires_in * 1000,
+        "scopes": data.get("scope", OAUTH_SCOPES).split(),
+        "subscriptionType": (data.get("account") or {}).get("subscription_type"),
+    }
+    _write_oauth(oauth, path or DEFAULT_CREDENTIAL_PATH)
+    return oauth
+
+
+def refresh_access_token(oauth: dict, path: Path) -> dict:
+    """Exchange the refresh token for a new access token. Re-reads the file
+    first (Claude Code may have already refreshed) to avoid a needless refresh
+    and reduce the rotating-refresh-token race. Raises NeedSignIn if the
+    refresh token is missing or rejected, TransientError on network trouble."""
+    # Tier 1 recheck: did someone (Claude Code) already refresh on disk?
+    fresh, fresh_path = load_oauth()
+    if fresh and fresh.get("accessToken") != oauth.get("accessToken"):
+        exp = fresh.get("expiresAt")
+        if exp and time.time() * 1000 < exp - EXPIRY_SKEW_MS:
+            return fresh  # someone beat us to it; use theirs, no network call
+        oauth, path = fresh, fresh_path or path
+
+    refresh = oauth.get("refreshToken")
+    if not refresh:
+        raise NeedSignIn("no refresh token stored")
+    data = _token_post({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": OAUTH_CLIENT_ID,
+    })
+    # Refresh responses may omit a rotated refresh token; keep the old one then.
+    data.setdefault("refresh_token", refresh)
+    return _store_token_response(data, path)
+
+
+def fetch_usage(token: str) -> dict:
     req = urllib.request.Request(
         USAGE_URL,
         headers={
@@ -92,6 +231,10 @@ def fmt_reset(iso_ts):
         return "?"
 
 
+# --------------------------------------------------------------------------- #
+# Indicator
+# --------------------------------------------------------------------------- #
+
 class UsageIndicator:
     def __init__(self):
         self.indicator = AppIndicator.Indicator.new(
@@ -105,6 +248,8 @@ class UsageIndicator:
         self.backoff = POLL_SECONDS
         self.detail_items = []
         self.status_item = None
+        self.signin_item = None
+        self.signin_in_progress = False
         self.build_menu()
         GLib.idle_add(self.refresh)
 
@@ -125,6 +270,10 @@ class UsageIndicator:
         refresh.connect("activate", lambda *_: self.refresh())
         menu.append(refresh)
 
+        self.signin_item = Gtk.MenuItem(label="Sign in to Claude…")
+        self.signin_item.connect("activate", lambda *_: self.start_signin())
+        menu.append(self.signin_item)
+
         usage_page = Gtk.MenuItem(label="Open claude.ai usage settings")
         usage_page.connect("activate", lambda *_: subprocess.Popen(
             ["xdg-open", "https://claude.ai/settings/usage"]))
@@ -142,27 +291,66 @@ class UsageIndicator:
 
     def refresh(self):
         threading.Thread(target=self._fetch, daemon=True).start()
-        return False  # one-shot; next poll scheduled in _apply/_fail
+        return False  # one-shot; next poll scheduled by the state handlers
 
     def _fetch(self):
-        token, _ = read_token()
-        if not token:
-            GLib.idle_add(self._fail,
-                          "No credentials — run Claude Code once to log in")
+        # Tier 1: passive re-read (picks up a token Claude Code just refreshed).
+        oauth, path = load_oauth()
+        if not oauth:
+            GLib.idle_add(self._need_signin,
+                          "No credentials — sign in to Claude")
             return
+
+        # Proactive refresh if the token is expired or about to be.
+        exp = oauth.get("expiresAt")
+        if exp and time.time() * 1000 > exp - EXPIRY_SKEW_MS:
+            try:
+                oauth = refresh_access_token(oauth, path)  # Tier 2
+            except NeedSignIn as e:
+                GLib.idle_add(self._need_signin, f"Session expired — {e}")
+                return
+            except TransientError as e:
+                GLib.idle_add(self._transient, str(e))
+                return
+
         try:
-            data = fetch_usage(token)
+            data = fetch_usage(oauth["accessToken"])
             GLib.idle_add(self._apply, data)
+            return
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                msg = "Token expired — open Claude Code to refresh it"
+                pass  # fall through to a refresh + one retry
             elif e.code == 429:
-                msg = "Rate limited — backing off"
+                GLib.idle_add(self._transient, "Rate limited — backing off", True)
+                return
             else:
-                msg = f"HTTP {e.code}"
-            GLib.idle_add(self._fail, msg, e.code == 429)
-        except Exception as e:  # network down, timeout, bad JSON…
-            GLib.idle_add(self._fail, f"Error: {e.__class__.__name__}")
+                GLib.idle_add(self._transient, f"HTTP {e.code}")
+                return
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            GLib.idle_add(self._transient, f"Offline ({e.__class__.__name__})")
+            return
+        except Exception as e:  # bad JSON, etc.
+            GLib.idle_add(self._transient, f"Error: {e.__class__.__name__}")
+            return
+
+        # Got a 401: Tier 2 refresh, then retry once.
+        try:
+            oauth = refresh_access_token(oauth, path)
+            data = fetch_usage(oauth["accessToken"])
+            GLib.idle_add(self._apply, data)
+        except NeedSignIn as e:
+            GLib.idle_add(self._need_signin, f"Session expired — {e}")
+        except TransientError as e:
+            GLib.idle_add(self._transient, str(e))
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                GLib.idle_add(self._need_signin, "Session expired — sign in again")
+            else:
+                GLib.idle_add(self._transient, f"HTTP {e.code}")
+        except Exception as e:
+            GLib.idle_add(self._transient, f"Error: {e.__class__.__name__}")
+
+    # ---- state handlers (main thread) ----
 
     def _apply(self, data):
         self.backoff = POLL_SECONDS
@@ -196,17 +384,131 @@ class UsageIndicator:
                 else "claude-usage-ok")
         self.indicator.set_icon_full(icon, "Claude usage")
 
+        self.signin_item.set_label("Sign in to Claude…")
         self.status_item.set_label(
             "Updated " + datetime.now().strftime("%H:%M:%S"))
         GLib.timeout_add_seconds(POLL_SECONDS, self.refresh)
 
-    def _fail(self, message, rate_limited=False):
+    def _transient(self, message, rate_limited=False):
+        """Network/server error — distinct 'offline' icon, keep last-good menu."""
         self.status_item.set_label(message)
-        self.indicator.set_label("!", "100% · wk 100%")
-        self.indicator.set_icon_full("claude-usage-warn", "Claude usage error")
+        self.indicator.set_label("offline", "100% · wk 100%")
+        self.indicator.set_icon_full("claude-usage-error", "Claude usage — offline")
         if rate_limited:
             self.backoff = min(self.backoff * 2, MAX_BACKOFF)
+        else:
+            self.backoff = POLL_SECONDS
         GLib.timeout_add_seconds(self.backoff, self.refresh)
+
+    def _need_signin(self, message):
+        """Refresh token is dead — show the sign-in icon and point at the menu."""
+        self.status_item.set_label(message + " — use “Sign in to Claude…” below")
+        self.signin_item.set_label("▶ Sign in to Claude…")
+        self.indicator.set_label("sign in", "100% · wk 100%")
+        self.indicator.set_icon_full("claude-usage-signin", "Claude — sign in needed")
+        # Slow poll while signed out; the sign-in flow triggers an immediate
+        # refresh on success.
+        GLib.timeout_add_seconds(MAX_BACKOFF, self.refresh)
+
+    # ---- in-app OAuth sign-in (PKCE) ----
+
+    def start_signin(self):
+        if self.signin_in_progress:
+            return
+        self.signin_in_progress = True
+
+        verifier = _b64url(secrets.token_bytes(32))
+        challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+        state = _b64url(secrets.token_bytes(32))
+        params = {
+            "code": "true",
+            "client_id": OAUTH_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "scope": OAUTH_SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+        url = OAUTH_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+        subprocess.Popen(["xdg-open", url])
+
+        dialog = Gtk.Dialog(title="Sign in to Claude")
+        dialog.set_modal(True)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Sign in", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        msg = Gtk.Label()
+        msg.set_line_wrap(True)
+        msg.set_max_width_chars(48)
+        msg.set_xalign(0.0)
+        msg.set_text(
+            "A browser window has opened. Approve access, then copy the code "
+            "shown on the page (it looks like  CODE#STATE ) and paste it here:")
+        box.add(msg)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Paste code here")
+        entry.set_activates_default(True)
+        box.add(entry)
+        dialog.show_all()
+
+        def on_response(dlg, response):
+            if response == Gtk.ResponseType.OK:
+                code = entry.get_text().strip()
+                dlg.destroy()
+                if code:
+                    self.status_item.set_label("Signing in…")
+                    threading.Thread(target=self._do_exchange,
+                                     args=(code, verifier, state),
+                                     daemon=True).start()
+                    return
+            dlg.destroy()
+            self.signin_in_progress = False
+
+        dialog.connect("response", on_response)
+
+    def _do_exchange(self, code_state, verifier, state):
+        # Page shows CODE#STATE; keep the code, prefer the returned state.
+        code = code_state
+        ret_state = state
+        if "#" in code_state:
+            code, ret_state = code_state.split("#", 1)
+        try:
+            data = _token_post({
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": OAUTH_REDIRECT_URI,
+                "client_id": OAUTH_CLIENT_ID,
+                "code_verifier": verifier,
+                "state": ret_state,
+            })
+            _, path = load_oauth()
+            _store_token_response(data, path or DEFAULT_CREDENTIAL_PATH)
+            GLib.idle_add(self._signin_done, True, "")
+        except AuthError as e:
+            GLib.idle_add(self._signin_done, False, str(e))
+        except TransientError as e:
+            GLib.idle_add(self._signin_done, False, str(e))
+        except Exception as e:
+            GLib.idle_add(self._signin_done, False, e.__class__.__name__)
+
+    def _signin_done(self, ok, message):
+        self.signin_in_progress = False
+        if ok:
+            self.status_item.set_label("Signed in — updating…")
+            self.refresh()
+        else:
+            dlg = Gtk.MessageDialog(
+                None, 0, Gtk.MessageType.ERROR, Gtk.ButtonsType.OK,
+                "Sign-in failed")
+            dlg.format_secondary_text(
+                f"{message}\n\nThe code may have expired — try “Sign in to "
+                "Claude…” again.")
+            dlg.run()
+            dlg.destroy()
 
 
 def main():
